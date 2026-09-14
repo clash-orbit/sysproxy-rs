@@ -1,3 +1,7 @@
+mod network;
+
+pub use network::NetworkServiceMonitor;
+
 use crate::{Autoproxy, Error, ProxyEndpoint, ProxySnapshot, Result, Sysproxy, WriteProgress};
 use log::debug;
 use std::process::{Command, Output, Stdio};
@@ -79,6 +83,15 @@ impl ProxyType {
 }
 
 impl Sysproxy {
+    /// Whether an active network service is available for proxy writes.
+    pub fn has_network_service() -> Result<bool> {
+        match get_active_network_service() {
+            Ok(_) => Ok(true),
+            Err(Error::NoActiveNetworkService | Error::NetworkInterface) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     #[inline]
     pub fn get_system_proxy() -> Result<Sysproxy> {
         let service_uuid = get_active_network_service_uuid()?;
@@ -616,7 +629,7 @@ fn get_active_network_service_uuid() -> Result<CFString> {
     let store = SCDynamicStoreBuilder::new("sysproxy-rs")
         .build()
         .ok_or(Error::SCDynamicStore)?;
-    let global_ipv4_key = CFString::from_static_string("State:/Network/Global/IPv4");
+    let global_ipv4_key = CFString::from_static_string(network::PRIMARY_SERVICE_KEY);
     let sets = store
         .get(global_ipv4_key)
         .ok_or(Error::NoActiveNetworkService)?;
