@@ -625,23 +625,66 @@ unsafe fn network_service_name_from_ptr(name: CFStringRef) -> Option<CFString> {
     }
 }
 
+/// Resolve the UUID of the active network service.
+///
+/// The DynamicStore's `State:/Network/Global/IPv4` normally reports a service
+/// UUID as `PrimaryService`. Some setups report a value `SCNetworkServiceCopy`
+/// cannot resolve (e.g. configd echoing the BSD interface name as
+/// `DHCP-en0`). When that happens, fall back to resolving the primary
+/// interface by its BSD name, then to the primary service reported for IPv6.
 fn get_active_network_service_uuid() -> Result<CFString> {
     let store = SCDynamicStoreBuilder::new("sysproxy-rs")
         .build()
         .ok_or(Error::SCDynamicStore)?;
-    let global_ipv4_key = CFString::from_static_string(network::PRIMARY_SERVICE_KEY);
-    let sets = store
-        .get(global_ipv4_key)
-        .ok_or(Error::NoActiveNetworkService)?;
-    if let Some(dict) = sets.downcast_into::<CFDictionary>() {
-        let key = CFString::from_static_string("PrimaryService");
-        let val_ptr = dict.find(key.as_CFTypeRef() as *const _);
-        if let Some(ptr) = val_ptr {
-            let service_id_cf = unsafe { CFString::wrap_under_get_rule(*ptr as _) };
-            return Ok(service_id_cf);
+    let scp = SCPreferences::default(&CFString::new("sysproxy-rs"));
+
+    for key in [network::PRIMARY_SERVICE_KEY, "State:/Network/Global/IPv6"] {
+        if let Some(uuid) = store
+            .get(CFString::from_static_string(key))
+            .and_then(|value| value.downcast_into::<CFDictionary>())
+            .and_then(|dict| dict_get_string(&dict, "PrimaryService"))
+        {
+            if service_uuid_resolves(&scp, &uuid) {
+                return Ok(uuid);
+            }
         }
     }
+
+    // The IPv4 primary service value was not a resolvable UUID; the same
+    // dictionary still reports the primary interface by BSD name, so resolve
+    // the owning service through preferences.
+    if let Some(bsd_name) = store
+        .get(CFString::from_static_string(network::PRIMARY_SERVICE_KEY))
+        .and_then(|value| value.downcast_into::<CFDictionary>())
+        .and_then(|dict| dict_get_string(&dict, "PrimaryInterface"))
+    {
+        if let Some(uuid) = get_service_id_by_bsd_name(&scp, &bsd_name.to_string()) {
+            return Ok(uuid);
+        }
+    }
+
     Err(Error::NoActiveNetworkService)
+}
+
+fn dict_get_string(dict: &CFDictionary, key: &'static str) -> Option<CFString> {
+    let cf_key = CFString::from_static_string(key);
+    dict.find(cf_key.as_CFTypeRef() as *const _)
+        .map(|ptr| {
+            // SAFETY: the DynamicStore values we read are retained CFStringRefs.
+            unsafe { CFString::wrap_under_get_rule(*ptr as _) }
+        })
+}
+
+fn service_uuid_resolves(scp: &SCPreferences, uuid: &CFString) -> bool {
+    unsafe {
+        let service_ref = SCNetworkServiceCopy(scp.as_concrete_TypeRef(), uuid.as_concrete_TypeRef());
+        if service_ref.is_null() {
+            false
+        } else {
+            CFRelease(service_ref);
+            true
+        }
+    }
 }
 
 fn parse_proxies_from_dict(
@@ -724,21 +767,20 @@ fn read_host(cfd: &CFDictionary<CFString, CFType>, key: &'static str) -> String 
         .unwrap_or_default()
 }
 
-// #[allow(dead_code)]
-// fn get_service_id_by_bsd_name(scp: &SCPreferences, bsd_name: &str) -> Option<CFString> {
-//     let services = SCNetworkService::get_services(scp);
-//     for service in &services {
-//         if let Some(interface) = service
-//             .network_interface()
-//             .and_then(|scn_inter| scn_inter.bsd_name().map(|name| name.to_string()))
-//         {
-//             if interface == bsd_name {
-//                 return service.id();
-//             }
-//         }
-//     }
-//     None
-// }
+fn get_service_id_by_bsd_name(scp: &SCPreferences, bsd_name: &str) -> Option<CFString> {
+    let services = SCNetworkService::get_services(scp);
+    for service in &services {
+        if let Some(interface) = service
+            .network_interface()
+            .and_then(|scn_inter| scn_inter.bsd_name().map(|name| name.to_string()))
+        {
+            if interface == bsd_name {
+                return service.id();
+            }
+        }
+    }
+    None
+}
 
 fn get_service_id_by_display_name(scp: &SCPreferences, name: &CFString) -> Option<CFString> {
     let services = SCNetworkService::get_services(scp);
