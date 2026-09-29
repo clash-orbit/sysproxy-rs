@@ -209,7 +209,8 @@ pub enum Error {
     #[error("failed to interact with SCDynamicStore")]
     SCDynamicStore,
 
-    /// No service is primary: the machine is offline or mid network switch.
+    /// No usable primary service: the machine is offline, mid network switch, or the primary
+    /// service named by the dynamic store cannot be resolved in the preferences store yet.
     #[cfg(target_os = "macos")]
     #[error("no active network service")]
     NoActiveNetworkService,

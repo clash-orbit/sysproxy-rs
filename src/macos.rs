@@ -342,7 +342,11 @@ impl NativeProxyWriter {
             );
             if service.is_null() {
                 SCPreferencesUnlock(preferences.as_concrete_TypeRef());
-                return Err(Error::SystemConfiguration("resolve active network service"));
+                // The dynamic store names a primary service the preferences store cannot resolve
+                // yet: the login window (a login item starts before DHCP completes), a network
+                // switch, or a VPN handoff. That is the same condition as no primary service, and
+                // callers must see it as such instead of as a failed configuration write.
+                return Err(Error::NoActiveNetworkService);
             }
 
             let protocol = SCNetworkServiceCopyProtocol(
@@ -608,7 +612,9 @@ fn get_active_network_service() -> Result<CFString> {
             service_uuid.as_concrete_TypeRef(),
         );
         if service_ref.is_null() {
-            return Err(Error::NetworkInterface);
+            // The named primary service is not in the preferences store yet; report the same
+            // condition as a missing primary service instead of a generic interface failure.
+            return Err(Error::NoActiveNetworkService);
         }
 
         let name = network_service_name_from_ptr(SCNetworkServiceGetName(service_ref));
