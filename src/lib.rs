@@ -205,6 +205,11 @@ pub enum Error {
     #[error("SystemConfiguration operation failed: {0}")]
     SystemConfiguration(&'static str),
 
+    /// Carries the `SCError()` status of the last attempt.
+    #[cfg(target_os = "macos")]
+    #[error("SystemConfiguration operation failed: lock preferences (status {0})")]
+    PreferencesLock(i32),
+
     #[cfg(target_os = "macos")]
     #[error("failed to interact with SCDynamicStore")]
     SCDynamicStore,
