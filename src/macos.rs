@@ -15,10 +15,11 @@ use system_configuration::sys::{
 use system_configuration::{core_foundation::dictionary::CFDictionary, preferences::SCPreferences};
 use system_configuration::{
     core_foundation::{array::CFArray, base::TCFType},
-    network_configuration::SCNetworkService,
+    network_configuration::{SCNetworkService, SCNetworkSet},
     sys::network_configuration::{
         SCNetworkProtocolGetConfiguration, SCNetworkServiceCopy, SCNetworkServiceCopyProtocol,
-        SCNetworkServiceGetName, SCNetworkServiceRef,
+        SCNetworkServiceGetEnabled, SCNetworkServiceGetName, SCNetworkServiceRef,
+        SCNetworkSetCopyCurrent, SCNetworkSetCopyServices,
     },
     sys::preferences::{SCPreferencesLock, SCPreferencesUnlock},
 };
@@ -96,8 +97,8 @@ impl Sysproxy {
 
     #[inline]
     pub fn get_system_proxy() -> Result<Sysproxy> {
-        let service_uuid = get_active_network_service_uuid()?;
         let scp = SCPreferences::default(&CFString::new("sysproxy-rs"));
+        let service_uuid = get_active_network_service_uuid(&scp)?;
         let proxies_dict = resolve_proxies_dict(&scp, &service_uuid)?;
 
         let mut socks = parse_proxies_from_dict(&proxies_dict, ProxyType::Socks)?;
@@ -136,8 +137,8 @@ impl Sysproxy {
     /// All fields come from one resolved dictionary for a consistent snapshot.
     #[inline]
     pub fn snapshot() -> Result<ProxySnapshot> {
-        let service_uuid = get_active_network_service_uuid()?;
         let scp = SCPreferences::default(&CFString::new("sysproxy-rs"));
+        let service_uuid = get_active_network_service_uuid(&scp)?;
         let proxies_dict = resolve_proxies_dict(&scp, &service_uuid)?;
 
         let endpoint = |proxy_type: ProxyType| -> Result<ProxyEndpoint> {
@@ -296,8 +297,8 @@ impl Autoproxy {
     #[inline]
     /// Read PAC settings from the resolved service dictionary.
     pub fn get_auto_proxy() -> Result<Autoproxy> {
-        let service_uuid = get_active_network_service_uuid()?;
         let scp = SCPreferences::default(&CFString::new("sysproxy-rs"));
+        let service_uuid = get_active_network_service_uuid(&scp)?;
         let proxies_dict = resolve_proxies_dict(&scp, &service_uuid)?;
         parse_proxyauto_from_dict(&proxies_dict)
     }
@@ -354,12 +355,16 @@ struct NativeProxyWriter {
 
 impl NativeProxyWriter {
     fn open() -> Result<Self> {
-        let service_id = get_active_network_service_uuid()?;
+        let primary = read_primary_ipv4()?;
         let preferences = SCPreferences::default(&CFString::new("sysproxy-rs privileged native"));
+        // Resolve only after locking: a session that read the preferences before locking fails
+        // the lock as stale when they changed in between.
         lock_preferences(&preferences)?;
 
         unsafe {
-            let service = match copy_network_service(&preferences, &service_id) {
+            let service = match resolve_active_service(&preferences, &primary)
+                .and_then(|service_id| copy_network_service(&preferences, &service_id))
+            {
                 Ok(service) => service,
                 Err(error) => {
                     SCPreferencesUnlock(preferences.as_concrete_TypeRef());
@@ -622,8 +627,8 @@ fn set_bypass(writes: &mut WriteSequence, proxy: &Sysproxy, service: &str) -> Re
 }
 
 fn get_active_network_service() -> Result<CFString> {
-    let service_uuid = get_active_network_service_uuid()?;
     let scp = SCPreferences::default(&CFString::new("sysproxy-rs"));
+    let service_uuid = get_active_network_service_uuid(&scp)?;
     unsafe {
         let service_ref = copy_network_service(&scp, &service_uuid)?;
         let name = network_service_name_from_ptr(SCNetworkServiceGetName(service_ref));
@@ -659,23 +664,141 @@ unsafe fn network_service_name_from_ptr(name: CFStringRef) -> Option<CFString> {
     }
 }
 
-fn get_active_network_service_uuid() -> Result<CFString> {
+fn get_active_network_service_uuid(preferences: &SCPreferences) -> Result<CFString> {
+    resolve_active_service(preferences, &read_primary_ipv4()?)
+}
+
+/// The IPv4 primary as the dynamic store names it.
+struct PrimaryIpv4 {
+    service: CFString,
+    interface: Option<CFString>,
+}
+
+fn read_primary_ipv4() -> Result<PrimaryIpv4> {
     let store = SCDynamicStoreBuilder::new("sysproxy-rs")
         .build()
         .ok_or(Error::SCDynamicStore)?;
     let global_ipv4_key = CFString::from_static_string(network::PRIMARY_SERVICE_KEY);
-    let sets = store
+    let dict = store
         .get(global_ipv4_key)
+        .and_then(|value| value.downcast_into::<CFDictionary>())
         .ok_or(Error::NoActiveNetworkService)?;
-    if let Some(dict) = sets.downcast_into::<CFDictionary>() {
-        let key = CFString::from_static_string("PrimaryService");
-        let val_ptr = dict.find(key.as_CFTypeRef() as *const _);
-        if let Some(ptr) = val_ptr {
-            let service_id_cf = unsafe { CFString::wrap_under_get_rule(*ptr as _) };
-            return Ok(service_id_cf);
-        }
+    Ok(PrimaryIpv4 {
+        service: dictionary_string(&dict, "PrimaryService").ok_or(Error::NoActiveNetworkService)?,
+        interface: dictionary_string(&dict, "PrimaryInterface"),
+    })
+}
+
+fn dictionary_string(dict: &CFDictionary, key: &'static str) -> Option<CFString> {
+    let key = CFString::from_static_string(key);
+    let value = dict.find(key.as_CFTypeRef() as *const _)?;
+    unsafe { CFType::wrap_under_get_rule(*value as _) }.downcast_into::<CFString>()
+}
+
+/// Maps the primary to a service in the preferences, the only place proxy settings can be written.
+///
+/// `ipconfig set en0 DHCP` swaps the interface's configured IPv4 service for one ipconfigd names
+/// after the method and interface, such as `DHCP-en0`, which the preferences lack. The interface's
+/// configured service is still the one that holds its proxy settings, so fall back to it.
+fn resolve_active_service(preferences: &SCPreferences, primary: &PrimaryIpv4) -> Result<CFString> {
+    if let Ok(service) = copy_network_service(preferences, &primary.service) {
+        unsafe { CFRelease(service.cast()) };
+        return Ok(primary.service.clone());
     }
-    Err(Error::NoActiveNetworkService)
+    let interface = primary
+        .interface
+        .as_ref()
+        .ok_or(Error::NoActiveNetworkService)?
+        .to_string();
+    // Any other unknown primary, such as a VPN's or one deleted since it was read, still reads as
+    // none rather than being swapped for whatever else is configured on the interface.
+    if !is_ipconfig_service_on(&primary.service.to_string(), &interface) {
+        return Err(Error::NoActiveNetworkService);
+    }
+    let (services, service_order) = current_set_services(preferences);
+    let service = pick_service_on_interface(&services, &service_order, &interface)
+        .ok_or(Error::NoActiveNetworkService)?;
+    debug!(
+        "primary service {} is not in the network preferences; using {} on {interface}",
+        primary.service, service.id
+    );
+    Ok(CFString::new(&service.id))
+}
+
+/// The IPv4 methods `ipconfig set` accepts; `NONE` stops the interface's services instead.
+const IPCONFIG_IPV4_METHODS: [&str; 6] =
+    ["BOOTP", "DHCP", "FAILOVER", "INFORM", "LINKLOCAL", "MANUAL"];
+
+/// Whether `service` is the `<method>-<interface>` id ipconfigd gives a service it started for
+/// `ipconfig set` on `interface`.
+fn is_ipconfig_service_on(service: &str, interface: &str) -> bool {
+    !interface.is_empty()
+        && service
+            .strip_suffix(interface)
+            .and_then(|method| method.strip_suffix('-'))
+            .is_some_and(|method| IPCONFIG_IPV4_METHODS.contains(&method))
+}
+
+/// A service of the current network set.
+#[derive(Debug)]
+struct SetService {
+    id: String,
+    interface: Option<String>,
+    enabled: bool,
+}
+
+/// Services of the current set, the only set configd applies, and the set's service order.
+fn current_set_services(preferences: &SCPreferences) -> (Vec<SetService>, Vec<String>) {
+    let set = unsafe { SCNetworkSetCopyCurrent(preferences.as_concrete_TypeRef()) };
+    if set.is_null() {
+        return (Vec::new(), Vec::new());
+    }
+    let set = unsafe { SCNetworkSet::wrap_under_create_rule(set) };
+    let service_order = set
+        .service_order()
+        .iter()
+        .map(|id| id.to_string())
+        .collect();
+
+    let services = unsafe { SCNetworkSetCopyServices(set.as_concrete_TypeRef()) };
+    if services.is_null() {
+        return (Vec::new(), service_order);
+    }
+    let services = unsafe { CFArray::<SCNetworkService>::wrap_under_create_rule(services) };
+    let services = services
+        .iter()
+        .filter_map(|service| {
+            Some(SetService {
+                id: service.id()?.to_string(),
+                interface: service
+                    .network_interface()
+                    .and_then(|interface| interface.bsd_name())
+                    .map(|name| name.to_string()),
+                // `SCNetworkService::enabled` inverts the result, so ask directly.
+                enabled: unsafe { SCNetworkServiceGetEnabled(service.as_concrete_TypeRef()) } != 0,
+            })
+        })
+        .collect();
+    (services, service_order)
+}
+
+/// The enabled service on `interface` that ranks first in the service order, which is the one
+/// configd prefers when several share the interface; unordered services rank last.
+fn pick_service_on_interface<'a>(
+    services: &'a [SetService],
+    service_order: &[String],
+    interface: &str,
+) -> Option<&'a SetService> {
+    let rank = |service: &SetService| {
+        service_order
+            .iter()
+            .position(|id| *id == service.id)
+            .unwrap_or(service_order.len())
+    };
+    services
+        .iter()
+        .filter(|service| service.enabled && service.interface.as_deref() == Some(interface))
+        .min_by_key(|service| rank(service))
 }
 
 fn parse_proxies_from_dict(
@@ -757,22 +880,6 @@ fn read_host(cfd: &CFDictionary<CFString, CFType>, key: &'static str) -> String 
         .and_then(|x| x.downcast::<CFString>().map(|s| s.to_string()))
         .unwrap_or_default()
 }
-
-// #[allow(dead_code)]
-// fn get_service_id_by_bsd_name(scp: &SCPreferences, bsd_name: &str) -> Option<CFString> {
-//     let services = SCNetworkService::get_services(scp);
-//     for service in &services {
-//         if let Some(interface) = service
-//             .network_interface()
-//             .and_then(|scn_inter| scn_inter.bsd_name().map(|name| name.to_string()))
-//         {
-//             if interface == bsd_name {
-//                 return service.id();
-//             }
-//         }
-//     }
-//     None
-// }
 
 fn get_service_id_by_display_name(scp: &SCPreferences, name: &CFString) -> Option<CFString> {
     let services = SCNetworkService::get_services(scp);
