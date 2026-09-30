@@ -18,7 +18,7 @@ use system_configuration::{
     network_configuration::SCNetworkService,
     sys::network_configuration::{
         SCNetworkProtocolGetConfiguration, SCNetworkServiceCopy, SCNetworkServiceCopyProtocol,
-        SCNetworkServiceGetName,
+        SCNetworkServiceGetName, SCNetworkServiceRef,
     },
     sys::preferences::{SCPreferencesLock, SCPreferencesUnlock},
 };
@@ -359,14 +359,13 @@ impl NativeProxyWriter {
         lock_preferences(&preferences)?;
 
         unsafe {
-            let service = SCNetworkServiceCopy(
-                preferences.as_concrete_TypeRef(),
-                service_id.as_concrete_TypeRef(),
-            );
-            if service.is_null() {
-                SCPreferencesUnlock(preferences.as_concrete_TypeRef());
-                return Err(Error::SystemConfiguration("resolve active network service"));
-            }
+            let service = match copy_network_service(&preferences, &service_id) {
+                Ok(service) => service,
+                Err(error) => {
+                    SCPreferencesUnlock(preferences.as_concrete_TypeRef());
+                    return Err(error);
+                }
+            };
 
             let protocol = SCNetworkServiceCopyProtocol(
                 service,
@@ -626,18 +625,30 @@ fn get_active_network_service() -> Result<CFString> {
     let service_uuid = get_active_network_service_uuid()?;
     let scp = SCPreferences::default(&CFString::new("sysproxy-rs"));
     unsafe {
-        let service_ref = SCNetworkServiceCopy(
-            scp.as_concrete_TypeRef(),
-            service_uuid.as_concrete_TypeRef(),
-        );
-        if service_ref.is_null() {
-            return Err(Error::NetworkInterface);
-        }
-
+        let service_ref = copy_network_service(&scp, &service_uuid)?;
         let name = network_service_name_from_ptr(SCNetworkServiceGetName(service_ref));
         CFRelease(service_ref);
         name.ok_or(Error::NetworkInterface)
     }
+}
+
+/// Copies a service by id; the caller releases it. The dynamic store can name a primary service
+/// the preferences lack, such as a VPN's, and that reads as no usable service.
+fn copy_network_service(
+    preferences: &SCPreferences,
+    service_id: &CFString,
+) -> Result<SCNetworkServiceRef> {
+    let service = unsafe {
+        SCNetworkServiceCopy(
+            preferences.as_concrete_TypeRef(),
+            service_id.as_concrete_TypeRef(),
+        )
+    };
+    if service.is_null() {
+        debug!("network service {service_id} is not in the network preferences");
+        return Err(Error::NoActiveNetworkService);
+    }
+    Ok(service)
 }
 
 unsafe fn network_service_name_from_ptr(name: CFStringRef) -> Option<CFString> {
@@ -782,8 +793,11 @@ fn resolve_proxies_dict(
     scp: &SCPreferences,
     service_uuid: &CFString,
 ) -> Result<CFDictionary<CFString, CFType>> {
-    if let Ok(dict) = get_proxies_by_service_uuid(scp, service_uuid) {
-        return Ok(dict);
+    match get_proxies_by_service_uuid(scp, service_uuid) {
+        Ok(dict) => return Ok(dict),
+        // `Setup:` mirrors the preferences, so it cannot hold a service they lack.
+        Err(error @ Error::NoActiveNetworkService) => return Err(error),
+        Err(_) => {}
     }
 
     let store = SCDynamicStoreBuilder::new("sysproxy-rs")
@@ -805,13 +819,7 @@ fn get_proxies_by_service_uuid(
     service_uuid: &CFString,
 ) -> Result<CFDictionary<CFString, CFType>> {
     unsafe {
-        let service_ref = SCNetworkServiceCopy(
-            scp.as_concrete_TypeRef(),
-            service_uuid.as_concrete_TypeRef(),
-        );
-        if service_ref.is_null() {
-            return Err(Error::SCPreferences);
-        }
+        let service_ref = copy_network_service(scp, service_uuid)?;
 
         let protocol_ref = SCNetworkServiceCopyProtocol(
             service_ref,
@@ -858,6 +866,21 @@ fn test_get_service_id_by_display_name() {
     let proxies = get_proxies_by_service_uuid(&scp, &service_uuid).unwrap();
     assert!(!proxies.is_empty());
     println!("proxies: {:?}", proxies);
+}
+
+#[test]
+fn a_service_missing_from_the_preferences_reads_as_no_active_service() {
+    let scp = SCPreferences::default(&CFString::new("sysproxy-rs"));
+    let configured: Vec<String> = SCNetworkService::get_services(&scp)
+        .iter()
+        .filter_map(|service| service.id().map(|id| id.to_string()))
+        .collect();
+    let mut unknown = String::from("gpd.pan");
+    while configured.contains(&unknown) {
+        unknown.push('_');
+    }
+    let result = resolve_proxies_dict(&scp, &CFString::new(&unknown));
+    assert!(matches!(result, Err(Error::NoActiveNetworkService)));
 }
 
 /// Destructive and machine-dependent: changes the real Wi-Fi bypass list without restoring it.
