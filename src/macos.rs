@@ -4,7 +4,9 @@ pub use network::NetworkServiceMonitor;
 
 use crate::{Autoproxy, Error, ProxyEndpoint, ProxySnapshot, Result, Sysproxy, WriteProgress};
 use log::debug;
+use std::ffi::c_int;
 use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 use system_configuration::core_foundation::dictionary::CFMutableDictionary;
 use system_configuration::sys::{
     network_configuration::{SCNetworkProtocolRef, SCNetworkProtocolSetConfiguration},
@@ -318,6 +320,31 @@ impl Autoproxy {
     }
 }
 
+/// Bounded, because a privileged service must not wait indefinitely behind another writer.
+const PREFERENCES_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+const PREFERENCES_LOCK_RETRY: Duration = Duration::from_millis(20);
+/// `kSCStatusPrefsBusy`: another writer, such as `networksetup`, holds the lock.
+const SC_STATUS_PREFS_BUSY: c_int = 3002;
+
+#[link(name = "SystemConfiguration", kind = "framework")]
+unsafe extern "C" {
+    fn SCError() -> c_int;
+}
+
+fn lock_preferences(preferences: &SCPreferences) -> Result<()> {
+    let deadline = Instant::now() + PREFERENCES_LOCK_TIMEOUT;
+    loop {
+        if unsafe { SCPreferencesLock(preferences.as_concrete_TypeRef(), 0) } != 0 {
+            return Ok(());
+        }
+        let status = unsafe { SCError() };
+        if status != SC_STATUS_PREFS_BUSY || Instant::now() >= deadline {
+            return Err(Error::PreferencesLock(status));
+        }
+        std::thread::sleep(PREFERENCES_LOCK_RETRY);
+    }
+}
+
 struct NativeProxyWriter {
     preferences: SCPreferences,
     protocol: SCNetworkProtocolRef,
@@ -329,11 +356,7 @@ impl NativeProxyWriter {
     fn open() -> Result<Self> {
         let service_id = get_active_network_service_uuid()?;
         let preferences = SCPreferences::default(&CFString::new("sysproxy-rs privileged native"));
-
-        // A privileged service must not wait indefinitely behind another preferences writer.
-        if unsafe { SCPreferencesLock(preferences.as_concrete_TypeRef(), 0) } == 0 {
-            return Err(Error::SystemConfiguration("lock preferences"));
-        }
+        lock_preferences(&preferences)?;
 
         unsafe {
             let service = SCNetworkServiceCopy(
