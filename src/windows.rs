@@ -20,6 +20,21 @@ use winreg::{RegKey, enums};
 pub use windows::core::Error as Win32Error;
 
 const SUB_KEY: &str = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
+const POLICY_SUB_KEY: &str =
+    "SOFTWARE\\Policies\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
+
+fn open_internet_settings() -> Result<RegKey> {
+    let policy = RegKey::predef(enums::HKEY_LOCAL_MACHINE)
+        .open_subkey_with_flags(POLICY_SUB_KEY, enums::KEY_QUERY_VALUE)
+        .and_then(|key| key.get_value::<u32, _>("ProxySettingsPerUser"));
+    let root = match policy {
+        Ok(0) => enums::HKEY_LOCAL_MACHINE,
+        Ok(_) => enums::HKEY_CURRENT_USER,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => enums::HKEY_CURRENT_USER,
+        Err(error) => return Err(error.into()),
+    };
+    Ok(RegKey::predef(root).open_subkey_with_flags(SUB_KEY, enums::KEY_QUERY_VALUE)?)
+}
 
 fn encode_wide<S: AsRef<std::ffi::OsStr>>(string: S) -> Vec<u16> {
     std::os::windows::prelude::OsStrExt::encode_wide(string.as_ref())
@@ -178,8 +193,7 @@ fn notify_proxy_change() -> Result<()> {
 impl Sysproxy {
     #[inline]
     pub fn get_system_proxy() -> Result<Sysproxy> {
-        let hkcu = RegKey::predef(enums::HKEY_CURRENT_USER);
-        let cur_var = hkcu.open_subkey_with_flags(SUB_KEY, enums::KEY_QUERY_VALUE)?;
+        let cur_var = open_internet_settings()?;
         let enable = cur_var.get_value::<u32, _>("ProxyEnable").unwrap_or(0u32) == 1u32;
         let proxy_server = cur_var
             .get_value::<String, _>("ProxyServer")
@@ -233,8 +247,7 @@ impl Sysproxy {
 impl Autoproxy {
     #[inline]
     pub fn get_auto_proxy() -> Result<Autoproxy> {
-        let hkcu = RegKey::predef(enums::HKEY_CURRENT_USER);
-        let cur_var = hkcu.open_subkey_with_flags(SUB_KEY, enums::KEY_QUERY_VALUE)?;
+        let cur_var = open_internet_settings()?;
         let url = cur_var.get_value::<String, _>("AutoConfigURL");
         let enable = url.is_ok();
         let url = url.unwrap_or_default();
